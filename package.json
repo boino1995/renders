@@ -1,12 +1,15 @@
 {
-  "name": "iptv-proxy-panel",
+  "name": "clustercore-panel",
   "version": "1.0.0",
+  "type": "module",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "engines": { "node": "20.x" },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "express": "^4.18.2",
-    "node-fetch": "^2.6.9"
+    "axios": "^1.7.7",
+    "better-sqlite3": "^11.5.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "morgan": "^1.10.0"
   }
 }
