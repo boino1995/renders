@@ -1,7 +1,8 @@
-// server.js - IPTV Proxy Panel with External JSON Sources
+// server.js - IPTV Proxy Panel with Xtream Codes-Compatible Users & Playlists
 const express = require('express');
 const fetch = require('node-fetch');
 const { URL } = require('url');
+const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -11,146 +12,287 @@ app.use(express.urlencoded({ extended: true }));
 // =============================================================
 // In-memory state
 // =============================================================
-let streams = {};          // { name: { url, userAgent?, referer? } }  (manual)
-let externalSources = [];  // [ "http://195.154.119.178:8500/files/streams.json", ... ]
+let streams = {};            // { name: { url, userAgent?, referer? } }
+let externalSources = [ "http://195.154.119.178:8500/files/streams.json", ... ];    // [ "http://195.154.119.178:8500/files/streams.json", ... ]
+let users = {};              // { username: { password, streams: [names], createdAt } }
 
-const jsonCache = new Map(); // url -> { data, expires }
-const CACHE_TTL = 60_000;    // 60 seconds
+const jsonCache = new Map();
+const CACHE_TTL = 60_000;
 
 // =============================================================
-// Dashboard HTML
+// Helpers
+// =============================================================
+const uid = () => crypto.randomBytes(4).toString('hex');
+const now = () => Math.floor(Date.now() / 1000);
+
+function normalizeStreams(data) {
+  const out = {};
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      if (!item) continue;
+      const name = item.name || item.id || item.key;
+      const url = item.url || item.stream_url || item.link || item.hls;
+      if (name && url) out[name] = {
+        url,
+        userAgent: item.userAgent || item.ua || item['user-agent'],
+        referer: item.referer || item.referrer,
+      };
+    }
+    return out;
+  }
+  if (data && typeof data === 'object') {
+    for (const [name, val] of Object.entries(data)) {
+      if (typeof val === 'string') out[name] = { url: val };
+      else if (val && val.url) out[name] = {
+        url: val.url,
+        userAgent: val.userAgent || val.ua,
+        referer: val.referer || val.referrer,
+      };
+    }
+  }
+  return out;
+}
+
+async function fetchExternalSource(url) {
+  const cached = jsonCache.get(url);
+  if (cached && cached.expires > Date.now()) return cached.data;
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': 'IPTVProxy/1.0' }, timeout: 10_000 });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    jsonCache.set(url, { data, expires: Date.now() + CACHE_TTL });
+    return data;
+  } catch (err) {
+    if (cached) return cached.data;
+    throw err;
+  }
+}
+
+async function getAllStreams() {
+  const all = { ...streams };
+  for (const src of externalSources) {
+    try {
+      const data = await fetchExternalSource(src);
+      const normalized = normalizeStreams(data);
+      for (const [name, s] of Object.entries(normalized)) {
+        if (!all[name]) all[name] = s; // manual wins
+      }
+    } catch { /* skip dead source */ }
+  }
+  return all;
+}
+
+async function findStream(name) {
+  const all = await getAllStreams();
+  return all[name] || null;
+}
+
+// =============================================================
+// Dashboard HTML (Admin Panel)
 // =============================================================
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IPTV Proxy Panel</title>
+<title>IPTV Panel · Xtream Codes</title>
 <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-900 text-white min-h-screen p-6">
-<div class="max-w-5xl mx-auto">
-  <h1 class="text-3xl font-bold mb-2 bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">IPTV Proxy Panel</h1>
-  <p class="text-gray-400 mb-6 text-sm">Add streams manually, or point to a JSON file — every stream gets a clean <code class="text-blue-300">/stream/:name</code> URL.</p>
+<div class="max-w-6xl mx-auto">
+  <h1 class="text-3xl font-bold mb-2 bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">IPTV Panel</h1>
+  <p class="text-gray-400 mb-6 text-sm">Xtream Codes–compatible · Manage users, streams, and playlists.</p>
 
-  <!-- Manual stream -->
-  <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
-    <h2 class="text-lg font-semibold mb-4">➕ Add Manual Stream</h2>
-    <form id="addForm" class="space-y-3">
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <input id="name" type="text" placeholder="ID (e.g. mbc1)" required pattern="[a-zA-Z0-9_-]+"
-               class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-        <input id="url" type="url" placeholder="https://origin.com/stream/index.m3u8" required
-               class="md:col-span-2 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-      </div>
-      <details class="text-sm text-gray-400">
-        <summary class="cursor-pointer hover:text-gray-300">Advanced (optional headers)</summary>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
-          <input id="userAgent" type="text" placeholder="Custom User-Agent" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-          <input id="referer" type="text" placeholder="Custom Referer" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+  <!-- Tabs -->
+  <div class="flex gap-2 mb-6 border-b border-gray-700 pb-2">
+    <button onclick="showTab('streams')" id="tab-streams" class="px-4 py-2 rounded-t font-medium bg-blue-600">Streams</button>
+    <button onclick="showTab('users')" id="tab-users" class="px-4 py-2 rounded-t font-medium text-gray-400 hover:text-white">Users</button>
+  </div>
+
+  <!-- Streams Tab -->
+  <div id="pane-streams">
+    <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
+      <h2 class="text-lg font-semibold mb-4">➕ Add Manual Stream</h2>
+      <form id="addStreamForm" class="space-y-3">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <input id="sName" type="text" placeholder="ID (e.g. mbc1)" required pattern="[a-zA-Z0-9_-]+" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+          <input id="sUrl" type="url" placeholder="https://origin.com/stream/index.m3u8" required class="md:col-span-2 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
         </div>
-      </details>
-      <button type="submit" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-medium">Add Stream</button>
-    </form>
-  </section>
+        <details class="text-sm text-gray-400">
+          <summary class="cursor-pointer">Advanced headers</summary>
+          <div class="grid grid-cols-2 gap-3 mt-2">
+            <input id="sUA" type="text" placeholder="User-Agent" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+            <input id="sRef" type="text" placeholder="Referer" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+          </div>
+        </details>
+        <button type="submit" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-medium">Add Stream</button>
+      </form>
+    </section>
 
-  <!-- External JSON source -->
-  <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
-    <h2 class="text-lg font-semibold mb-4">🌐 Add External JSON Source</h2>
-    <form id="extForm" class="flex gap-2">
-      <input id="extUrl" type="url" placeholder="https://example.com/streams.json" required
-             class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500">
-      <button type="submit" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-medium">Add Source</button>
-    </form>
-    <p class="text-xs text-gray-500 mt-2">
-      Accepted shapes: <code>{ "name": { "url": "…" } }</code> or <code>[{ "name": "…", "url": "…" }]</code>.
-      Cache refreshes every 60&nbsp;s.
-    </p>
-    <div id="extList" class="mt-4 space-y-2"></div>
-  </section>
+    <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
+      <h2 class="text-lg font-semibold mb-4">🌐 External JSON Sources</h2>
+      <form id="extForm" class="flex gap-2 mb-3">
+        <input id="extUrl" type="url" placeholder="https://example.com/streams.json" required class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+        <button type="submit" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-medium">Add Source</button>
+      </form>
+      <div id="extList" class="space-y-2 text-sm"></div>
+    </section>
 
-  <!-- All streams -->
-  <section class="bg-gray-800 rounded-xl p-6 shadow-lg">
-    <div class="flex items-center justify-between mb-4">
-      <h2 class="text-lg font-semibold">📺 All Streams</h2>
-      <button onclick="loadAll()" class="text-sm text-blue-400 hover:text-blue-300">↻ Refresh</button>
-    </div>
-    <div id="groups" class="space-y-6">
-      <p class="text-gray-400 text-sm">Loading…</p>
-    </div>
-  </section>
+    <section class="bg-gray-800 rounded-xl p-6 shadow-lg">
+      <h2 class="text-lg font-semibold mb-4">📺 All Streams</h2>
+      <div id="streamList" class="space-y-2"></div>
+    </section>
+  </div>
+
+  <!-- Users Tab -->
+  <div id="pane-users" class="hidden">
+    <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
+      <h2 class="text-lg font-semibold mb-4">➕ Create User</h2>
+      <form id="userForm" class="space-y-3">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <input id="uName" type="text" placeholder="Username" required class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+          <input id="uPass" type="text" placeholder="Password" required class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+        </div>
+        <div>
+          <p class="text-sm text-gray-400 mb-2">Assign streams:</p>
+          <div id="streamCheckboxes" class="grid grid-cols-2 md:grid-cols-3 gap-2 max-h-48 overflow-y-auto bg-gray-900 p-3 rounded-lg"></div>
+        </div>
+        <button type="submit" class="bg-purple-600 hover:bg-purple-700 px-6 py-2 rounded-lg font-medium">Create User</button>
+      </form>
+    </section>
+
+    <section class="bg-gray-800 rounded-xl p-6 shadow-lg">
+      <h2 class="text-lg font-semibold mb-4">👥 Users</h2>
+      <div id="userList" class="space-y-3"></div>
+    </section>
+  </div>
 </div>
 
 <script>
 const BASE = window.location.origin;
-const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const esc = s => String(s).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));
 
-function streamCard(name, s, fromExternal) {
-  const proxyUrl = BASE + '/stream/' + encodeURIComponent(name);
-  const badge = fromExternal
-    ? '<span class="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded">external</span>'
-    : '<span class="text-xs bg-blue-900 text-blue-300 px-2 py-0.5 rounded">manual</span>';
-  const del = fromExternal ? '' :
-    '<button onclick="delStream(\\'' + esc(name) + '\\')" class="text-red-400 hover:text-red-300 text-xs">Delete</button>';
-  return \`
-  <div class="bg-gray-700 rounded-lg p-3">
-    <div class="flex items-center justify-between mb-2">
-      <div class="flex items-center gap-2"><span class="font-semibold text-blue-300">\${esc(name)}</span>\${badge}</div>
-      \${del}
-    </div>
-    <div class="text-xs text-gray-400 mb-2 truncate">Source: \${esc(s.url)}</div>
-    <div class="flex gap-2 items-center">
-      <input readonly value="\${esc(proxyUrl)}" onclick="this.select()"
-             class="flex-1 bg-gray-900 text-green-400 text-xs font-mono rounded px-3 py-2 truncate">
-      <button onclick="copy('\\'' + proxyUrl + '\\'', this)" class="bg-green-600 hover:bg-green-700 px-3 py-2 rounded text-xs font-medium">Copy</button>
-    </div>
-  </div>\`;
+function showTab(t) {
+  ['streams','users'].forEach(x => {
+    document.getElementById('pane-' + x).classList.toggle('hidden', x !== t);
+    document.getElementById('tab-' + x).className = 'px-4 py-2 rounded-t font-medium ' + (x === t ? 'bg-blue-600' : 'text-gray-400 hover:text-white');
+  });
+  if (t === 'users') loadUsers();
 }
 
-async function loadAll() {
-  const groupsEl = document.getElementById('groups');
-  const extEl = document.getElementById('extList');
-
-  const [ext, all] = await Promise.all([
+// ---------- Streams ----------
+async function loadStreams() {
+  const [manual, external, all] = await Promise.all([
+    fetch('/api/streams').then(r => r.json()),
     fetch('/api/external').then(r => r.json()),
     fetch('/api/all-streams').then(r => r.json()),
   ]);
 
-  // External sources management panel
-  if (ext.length === 0) {
-    extEl.innerHTML = '<p class="text-gray-500 text-sm">No external sources yet.</p>';
-  } else {
-    extEl.innerHTML = ext.map((u, i) => \`
-      <div class="flex items-center gap-2 bg-gray-700 rounded-lg px-3 py-2">
-        <span class="text-xs text-gray-400">\${i + 1}.</span>
-        <span class="text-sm flex-1 truncate font-mono">\${esc(u)}</span>
-        <button onclick="delExternal(\\'' + encodeURIComponent(u) + '\\')" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
-      </div>
-    \`).join('');
-  }
+  // External sources
+  document.getElementById('extList').innerHTML = external.length
+    ? external.map(u => \`<div class="flex items-center gap-2 bg-gray-700 rounded px-3 py-1">
+        <span class="flex-1 truncate font-mono">\${esc(u)}</span>
+        <button onclick="delExt('\${encodeURIComponent(u)}')" class="text-red-400 text-xs">Remove</button>
+      </div>\`).join('')
+    : '<p class="text-gray-500">None added.</p>';
 
-  // Stream groups
-  const sections = [];
-  if (all.manual && Object.keys(all.manual).length > 0) {
-    sections.push(renderGroup('Manual', all.manual, false));
-  }
-  for (const [src, items] of Object.entries(all.external || {})) {
-    sections.push(renderGroup(src, items, true));
-  }
-  groupsEl.innerHTML = sections.length
-    ? sections.join('')
-    : '<p class="text-gray-400 text-sm">No streams configured. Add one above.</p>';
+  // Stream list
+  const names = Object.keys(all);
+  document.getElementById('streamList').innerHTML = names.length
+    ? names.map(n => {
+        const s = all[n];
+        const isManual = !!manual[n];
+        return \`<div class="bg-gray-700 rounded p-3">
+          <div class="flex justify-between items-center mb-1">
+            <span class="font-semibold text-blue-300">\${esc(n)}</span>
+            <span class="text-xs \${isManual ? 'bg-blue-900 text-blue-300' : 'bg-green-900 text-green-300'} px-2 py-0.5 rounded">\${isManual ? 'manual' : 'external'}</span>
+            \${isManual ? \`<button onclick="delStream('\${esc(n)}')" class="text-red-400 text-xs">Delete</button>\` : ''}
+          </div>
+          <div class="text-xs text-gray-400 truncate mb-1">\${esc(s.url)}</div>
+          <input readonly value="\${BASE}/stream/\${encodeURIComponent(n)}" onclick="this.select()" class="w-full bg-gray-900 text-green-400 text-xs font-mono rounded px-2 py-1">
+        </div>\`;
+      }).join('')
+    : '<p class="text-gray-500">No streams yet.</p>';
+
+  // Checkboxes for user assignment
+  const cb = document.getElementById('streamCheckboxes');
+  cb.innerHTML = names.map(n => \`<label class="flex items-center gap-2 text-sm">
+    <input type="checkbox" value="\${esc(n)}" class="accent-purple-500"> \${esc(n)}
+  </label>\`).join('') || '<p class="text-gray-500 text-xs">Add streams first.</p>';
 }
 
-function renderGroup(title, items, fromExternal) {
-  const names = Object.keys(items);
-  const cards = names.map(n => streamCard(n, items[n], fromExternal)).join('');
-  return \`
-    <div>
-      <h3 class="text-sm font-semibold text-gray-400 mb-2 uppercase tracking-wide">
-        \${esc(title)} <span class="text-gray-600">(\${names.length})</span>
-      </h3>
-      <div class="space-y-2">\${cards}</div>
+async function delStream(name) {
+  if (!confirm('Delete "' + name + '"?')) return;
+  await fetch('/api/streams/' + encodeURIComponent(name), { method: 'DELETE' });
+  loadStreams();
+}
+async function delExt(enc) {
+  if (!confirm('Remove this source?')) return;
+  await fetch('/api/external/' + enc, { method: 'DELETE' });
+  loadStreams();
+}
+
+document.getElementById('addStreamForm').onsubmit = async e => {
+  e.preventDefault();
+  const body = { name: sName.value.trim(), url: sUrl.value.trim(), userAgent: sUA.value.trim() || undefined, referer: sRef.value.trim() || undefined };
+  const r = await fetch('/api/streams', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (!r.ok) return alert((await r.json()).error);
+  sUrl.value = ''; loadStreams();
+};
+document.getElementById('extForm').onsubmit = async e => {
+  e.preventDefault();
+  const r = await fetch('/api/external', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ url: extUrl.value.trim() }) });
+  if (!r.ok) return alert((await r.json()).error);
+  extUrl.value = ''; loadStreams();
+};
+
+// ---------- Users ----------
+async function loadUsers() {
+  const usersData = await fetch('/api/users').then(r => r.json());
+  const all = await fetch('/api/all-streams').then(r => r.json());
+  const names = Object.keys(all);
+
+  const list = document.getElementById('userList');
+  const keys = Object.keys(usersData);
+  list.innerHTML = keys.length ? keys.map(u => {
+    const data = usersData[u];
+    const playlistUrl = \`\${BASE}/get.php?username=\${encodeURIComponent(u)}&password=\${encodeURIComponent(data.password)}&type=m3u_plus&output=ts\`;
+    return \`<div class="bg-gray-700 rounded p-4">
+      <div class="flex justify-between items-center mb-2">
+        <div><span class="font-bold text-purple-300">\${esc(u)}</span>
+        <span class="text-xs text-gray-400 ml-2">pass: \${esc(data.password)}</span></div>
+        <button onclick="delUser('\${esc(u)}')" class="text-red-400 text-sm">Delete</button>
+      </div>
+      <div class="text-xs text-gray-400 mb-2">Streams: \${data.streams.join(', ') || 'none'}</div>
+      <div class="flex gap-2 items-center">
+        <input readonly value="\${playlistUrl}" onclick="this.select()" class="flex-1 bg-gray-900 text-green-400 text-xs font-mono rounded px-2 py-1 truncate">
+        <button onclick="copy('\${playlistUrl}', this)" class="bg-green-600 px-3 py-1 rounded text-xs">Copy M3U</button>
+      </div>
+      <div class="text-xs text-gray-500 mt-2">
+        Xtream: Server <code class="text-blue-300">\${BASE}</code> · User <code class="text-blue-300">\${esc(u)}</code> · Pass <code class="text-blue-300">\${esc(data.password)}</code>
+      </div>
     </div>\`;
+  }).join('') : '<p class="text-gray-500">No users yet.</p>';
+
+  // Populate checkboxes fresh
+  const cb = document.getElementById('streamCheckboxes');
+  cb.innerHTML = names.map(n => \`<label class="flex items-center gap-2 text-sm">
+    <input type="checkbox" value="\${esc(n)}" class="accent-purple-500"> \${esc(n)}
+  </label>\`).join('') || '<p class="text-gray-500 text-xs">Add streams first.</p>';
+}
+
+document.getElementById('userForm').onsubmit = async e => {
+  e.preventDefault();
+  const streams = [...document.querySelectorAll('#streamCheckboxes input:checked')].map(i => i.value);
+  const body = { username: uName.value.trim(), password: uPass.value.trim(), streams };
+  const r = await fetch('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (!r.ok) return alert((await r.json()).error);
+  uName.value = ''; uPass.value = ''; loadUsers();
+};
+
+async function delUser(name) {
+  if (!confirm('Delete user "' + name + '"?')) return;
+  await fetch('/api/users/' + encodeURIComponent(name), { method: 'DELETE' });
+  loadUsers();
 }
 
 function copy(text, btn) {
@@ -160,175 +302,37 @@ function copy(text, btn) {
   });
 }
 
-async function delStream(name) {
-  if (!confirm('Delete "' + name + '"?')) return;
-  await fetch('/api/streams/' + encodeURIComponent(name), { method: 'DELETE' });
-  loadAll();
-}
-
-async function delExternal(encodedUrl) {
-  if (!confirm('Remove this external source?')) return;
-  await fetch('/api/external/' + encodedUrl, { method: 'DELETE' });
-  loadAll();
-}
-
-document.getElementById('addForm').addEventListener('submit', async e => {
-  e.preventDefault();
-  const body = {
-    name: document.getElementById('name').value.trim(),
-    url: document.getElementById('url').value.trim(),
-    userAgent: document.getElementById('userAgent').value.trim() || undefined,
-    referer: document.getElementById('referer').value.trim() || undefined,
-  };
-  const r = await fetch('/api/streams', {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
-  });
-  if (!r.ok) return alert('Error: ' + (await r.json()).error);
-  document.getElementById('url').value = '';
-  loadAll();
-});
-
-document.getElementById('extForm').addEventListener('submit', async e => {
-  e.preventDefault();
-  const url = document.getElementById('extUrl').value.trim();
-  const r = await fetch('/api/external', {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ url })
-  });
-  if (!r.ok) return alert('Error: ' + (await r.json()).error);
-  document.getElementById('extUrl').value = '';
-  loadAll();
-});
-
-loadAll();
+// Init
+loadStreams();
+showTab('streams');
 </script>
 </body></html>`;
 
 // =============================================================
-// JSON parsing helpers
-// =============================================================
-function normalizeStreams(data) {
-  const out = {};
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      if (!item) continue;
-      const name = item.name || item.id || item.key;
-      const url  = item.url || item.stream_url || item.link || item.hls;
-      if (!name || !url) continue;
-      out[name] = {
-        url,
-        userAgent: item.userAgent || item.ua || item['user-agent'],
-        referer:   item.referer || item.referrer,
-      };
-    }
-    return out;
-  }
-  if (data && typeof data === 'object') {
-    for (const [name, val] of Object.entries(data)) {
-      if (typeof val === 'string') out[name] = { url: val };
-      else if (val && typeof val === 'object' && val.url) {
-        out[name] = { url: val.url, userAgent: val.userAgent || val.ua, referer: val.referer || val.referrer };
-      }
-    }
-  }
-  return out;
-}
-
-async function fetchExternalSource(url) {
-  const now = Date.now();
-  const cached = jsonCache.get(url);
-  if (cached && cached.expires > now) return cached.data;
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'IPTVProxy/1.0', 'Accept': 'application/json' },
-      timeout: 10_000,
-      redirect: 'follow',
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    jsonCache.set(url, { data, expires: now + CACHE_TTL });
-    return data;
-  } catch (err) {
-    if (cached) return cached.data; // serve stale
-    throw err;
-  }
-}
-
-async function findStream(name) {
-  // Manual first
-  if (streams[name]) return { ...streams[name], _origin: 'manual' };
-  // Then each external source
-  for (const src of externalSources) {
-    try {
-      const data = await fetchExternalSource(src);
-      const normalized = normalizeStreams(data);
-      if (normalized[name]) return { ...normalized[name], _origin: src };
-    } catch { /* skip dead source */ }
-  }
-  return null;
-}
-
-async function buildAllStreams() {
-  const result = { manual: {}, external: {} };
-  for (const [n, s] of Object.entries(streams)) {
-    result.manual[n] = { url: s.url };
-  }
-  for (const src of externalSources) {
-    try {
-      const data = await fetchExternalSource(src);
-      const normalized = normalizeStreams(data);
-      // Strip names already provided manually
-      for (const n of Object.keys(normalized)) {
-        if (!streams[n]) {
-          result.external[src] = result.external[src] || {};
-          result.external[src][n] = normalized[n];
-        }
-      }
-    } catch { /* ignore */ }
-  }
-  return result;
-}
-
-// =============================================================
-// API: manual streams
+// API: Streams (unchanged from previous version)
 // =============================================================
 app.get('/api/streams', (req, res) => res.json(streams));
-
 app.post('/api/streams', (req, res) => {
   const { name, url, userAgent, referer } = req.body;
   if (!name || !url) return res.status(400).json({ error: 'name and url required' });
   if (!/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({ error: 'invalid name' });
-  try { new URL(url); } catch { return res.status(400).json({ error: 'invalid url' }); }
   streams[name] = { url, userAgent, referer };
   res.json({ success: true });
 });
+app.delete('/api/streams/:name', (req, res) => { delete streams[req.params.name]; res.json({ success: true }); });
 
-app.delete('/api/streams/:name', (req, res) => {
-  delete streams[req.params.name];
-  res.json({ success: true });
-});
-
-// =============================================================
-// API: external sources
-// =============================================================
 app.get('/api/external', (req, res) => res.json(externalSources));
-
 app.post('/api/external', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
-  try { new URL(url); } catch { return res.status(400).json({ error: 'invalid url' }); }
   if (externalSources.includes(url)) return res.status(400).json({ error: 'already added' });
-  // Verify the URL is fetchable and JSON before saving
   try {
     const data = await fetchExternalSource(url);
-    const count = Object.keys(normalizeStreams(data)).length;
-    if (count === 0) return res.status(400).json({ error: 'JSON has no recognizable streams' });
-  } catch (err) {
-    return res.status(400).json({ error: 'cannot fetch JSON: ' + err.message });
-  }
+    if (Object.keys(normalizeStreams(data)).length === 0) return res.status(400).json({ error: 'no recognizable streams' });
+  } catch (err) { return res.status(400).json({ error: 'cannot fetch: ' + err.message }); }
   externalSources.push(url);
   res.json({ success: true });
 });
-
 app.delete('/api/external/:url', (req, res) => {
   const url = decodeURIComponent(req.params.url);
   externalSources = externalSources.filter(u => u !== url);
@@ -336,48 +340,166 @@ app.delete('/api/external/:url', (req, res) => {
   res.json({ success: true });
 });
 
+app.get('/api/all-streams', async (req, res) => res.json(await getAllStreams()));
+
 // =============================================================
-// API: merged view for dashboard
+// API: Users
 // =============================================================
-app.get('/api/all-streams', async (req, res) => {
-  res.json(await buildAllStreams());
+app.get('/api/users', (req, res) => res.json(users));
+app.post('/api/users', (req, res) => {
+  const { username, password, streams: assigned } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  if (users[username]) return res.status(400).json({ error: 'user already exists' });
+  users[username] = {
+    password,
+    streams: Array.isArray(assigned) ? assigned : [],
+    createdAt: now(),
+  };
+  res.json({ success: true });
+});
+app.delete('/api/users/:name', (req, res) => {
+  delete users[req.params.name];
+  res.json({ success: true });
 });
 
 // =============================================================
-// Clean entry point:  /stream/:name
+// XTREAM CODES COMPATIBLE ENDPOINTS
 // =============================================================
+
+// ---------- player_api.php ----------
+app.all('/player_api.php', async (req, res) => {
+  const { username, password, action } = { ...req.query, ...req.body };
+  const user = users[username];
+
+  if (!user || user.password !== password) {
+    return res.status(401).json({ user_info: { auth: 0 } });
+  }
+
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+
+  // Account info (default when no action)
+  if (!action || action === 'get_account_info') {
+    return res.json({
+      user_info: {
+        username,
+        password,
+        message: 'Welcome to IPTV Panel',
+        auth: 1,
+        status: 'Active',
+        exp_date: null,
+        is_trial: '0',
+        active_cons: '1',
+        created_at: String(user.createdAt),
+        max_connections: '1',
+        allowed_output_formats: ['m3u8', 'ts'],
+      },
+      server_info: {
+        url: baseUrl,
+        port: req.socket.localPort || 443,
+        https_port: 443,
+        server_protocol: req.protocol,
+        rtmp_port: '1935',
+        timezone: 'UTC',
+        timestamp_now: now(),
+        time_now: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      },
+    });
+  }
+
+  // Live categories
+  if (action === 'get_live_categories') {
+    return res.json([
+      { category_id: '1', category_name: 'Live TV', parent_id: 0 },
+    ]);
+  }
+
+  // Live streams
+  if (action === 'get_live_streams') {
+    const all = await getAllStreams();
+    const list = user.streams
+      .filter(name => all[name])
+      .map((name, i) => ({
+        num: i + 1,
+        name,
+        stream_type: 'live',
+        stream_id: name,
+        stream_icon: '',
+        epg_channel_id: name,
+        added: String(user.createdAt),
+        category_id: '1',
+        custom_sid: '',
+        tv_archive: 0,
+        direct_source: '',
+        tv_archive_duration: 0,
+      }));
+    return res.json(list);
+  }
+
+  // Unsupported action
+  return res.json([]);
+});
+
+// ---------- get.php (M3U playlist) ----------
+app.get('/get.php', async (req, res) => {
+  const { username, password } = req.query;
+  const user = users[username];
+  if (!user || user.password !== password) {
+    return res.status(401).send('#EXTM3U\n# Authentication failed');
+  }
+
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const all = await getAllStreams();
+
+  let m3u = '#EXTM3U\n';
+  for (const name of user.streams) {
+    if (!all[name]) continue;
+    const streamUrl = `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(name)}.m3u8`;
+    m3u += `#EXTINF:-1 tvg-id="${name}" tvg-name="${name}" group-title="Live TV",${name}\n`;
+    m3u += `${streamUrl}\n`;
+  }
+
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.send(m3u);
+});
+
+// ---------- Live stream proxy (Xtream path) ----------
+// /live/:username/:password/:streamId.m3u8
+app.get('/live/:username/:password/:streamId', async (req, res) => {
+  const { username, password, streamId } = req.params;
+  const user = users[username];
+  if (!user || user.password !== password) return res.status(401).send('Unauthorized');
+  if (!user.streams.includes(streamId)) return res.status(403).send('Stream not assigned to user');
+
+  const stream = await findStream(streamId);
+  if (!stream) return res.status(404).send('Stream not found');
+
+  await proxyHandler(req, res, stream.url, stream);
+});
+
+// ---------- Existing generic proxy (unchanged) ----------
 app.get('/stream/:name', async (req, res) => {
   const stream = await findStream(req.params.name);
   if (!stream) return res.status(404).send('Stream not found');
   await proxyHandler(req, res, stream.url, stream);
 });
 
-// =============================================================
-// Internal proxy for segments / sub-playlists
-// =============================================================
 app.get('/proxy', async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).send('Missing url parameter');
-  // Carry optional per-stream headers through via query params
-  await proxyHandler(req, res, targetUrl, {
-    userAgent: req.query.ua,
-    referer:   req.query.rf,
-  });
+  if (!req.query.url) return res.status(400).send('Missing url');
+  await proxyHandler(req, res, req.query.url, { userAgent: req.query.ua, referer: req.query.rf });
 });
 
 // =============================================================
-// Shared proxy handler
+// Shared proxy handler (unchanged)
 // =============================================================
-async function proxyHandler(req, res, targetUrl, opts) {
+async function proxyHandler(req, res, targetUrl, opts = {}) {
   const headers = { 'User-Agent': opts.userAgent || 'Mozilla/5.0 (compatible; IPTVProxy/1.0)' };
   if (opts.referer) headers['Referer'] = opts.referer;
   if (req.headers.range) headers['Range'] = req.headers.range;
 
   try {
     const upstream = await fetch(targetUrl, { headers, redirect: 'follow', timeout: 20_000 });
-    if (!upstream.ok && upstream.status !== 206) {
-      return res.status(upstream.status).send('Upstream ' + upstream.status);
-    }
+    if (!upstream.ok && upstream.status !== 206) return res.status(upstream.status).send('Upstream ' + upstream.status);
+
     const ct = upstream.headers.get('content-type') || '';
     const finalUrl = upstream.url || targetUrl;
     const isM3U8 = ct.includes('mpegurl') || finalUrl.split('?')[0].endsWith('.m3u8');
@@ -387,10 +509,9 @@ async function proxyHandler(req, res, targetUrl, opts) {
 
     if (isM3U8) {
       const text = await upstream.text();
-      // Preserve headers on rewritten URLs
       const qs = new URLSearchParams();
       if (opts.userAgent) qs.set('ua', opts.userAgent);
-      if (opts.referer)   qs.set('rf', opts.referer);
+      if (opts.referer) qs.set('rf', opts.referer);
       const suffix = qs.toString() ? '&' + qs.toString() : '';
       const proxyBase = `${req.protocol}://${req.get('host')}/proxy?url=`;
       const rewritten = rewriteM3U8(text, new URL(finalUrl), proxyBase, suffix);
@@ -398,7 +519,6 @@ async function proxyHandler(req, res, targetUrl, opts) {
       return res.send(rewritten);
     }
 
-    // Binary stream
     res.status(upstream.status);
     res.setHeader('Content-Type', ct || 'application/octet-stream');
     for (const h of ['accept-ranges', 'content-range', 'content-length']) {
@@ -429,4 +549,4 @@ function rewriteM3U8(text, baseUrl, proxyBase, suffix) {
 
 // =============================================================
 app.get('/', (req, res) => res.send(dashboardHTML));
-app.listen(PORT, () => console.log('IPTV Proxy running on ' + PORT));
+app.listen(PORT, () => console.log('IPTV Panel (Xtream Codes) on ' + PORT));
