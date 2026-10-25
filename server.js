@@ -13,7 +13,7 @@ app.use(express.urlencoded({ extended: true }));
 // In-memory state
 // =============================================================
 let streams = {};            // { name: { url, userAgent?, referer? } }
-let externalSources = [ "http://195.154.119.178:8500/files/streams.json", ... ];    // [ "http://195.154.119.178:8500/files/streams.json", ... ]
+let externalSources = ["http://195.154.119.178:8500/files/streams.json"];    // [ "http://195.154.119.178:8500/files/streams.json", ... ]
 let users = {};              // { username: { password, streams: [names], createdAt } }
 
 const jsonCache = new Map();
