@@ -431,7 +431,7 @@ app.all('/player_api.php', async (req, res) => {
       custom_sid: '',
       tv_archive: 0,
       // Filled so TiviMate/Smarters skip URL construction and use this directly
-      direct_source: `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(name)}.m3u8`,
+      direct_source: `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(name)}`,
       tv_archive_duration: 0,
     }));
     return res.json(list);
@@ -457,7 +457,7 @@ app.get('/get.php', async (req, res) => {
 
   let m3u = '#EXTM3U\n';
   for (const name of Object.keys(all)) {
-    const streamUrl = `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(name)}.m3u8`;
+    const streamUrl = `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(name)}`;
     m3u += `#EXTINF:-1 tvg-id="${name}" tvg-name="${name}" group-title="Live TV",${name}\n`;
     m3u += `${streamUrl}\n`;
   }
