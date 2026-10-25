@@ -397,8 +397,8 @@ app.all('/player_api.php', async (req, res) => {
         is_trial: '0',
         active_cons: '1',
         created_at: String(user.createdAt),
-        max_connections: '5',
-        allowed_output_formats: ['m3u8', 'ts'],
+        max_connections: '10',
+        allowed_output_formats: ['ts'],
       },
       server_info: {
         url: baseUrl,
