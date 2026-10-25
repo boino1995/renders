@@ -13,7 +13,7 @@ app.use(express.urlencoded({ extended: true }));
 // =============================================================
 let streams = {};            // { name: { url, userAgent?, referer? } }
 let externalSources = ["http://195.154.119.178:8500/files/streams.json"];    // [ "http://195.154.119.178:8500/files/streams.json", ... ]
-let users = {};              // { username: { password, createdAt } }
+let users = {"ssss":{"password":"ssss","createdAt":1792966152}};              // { username: { password, createdAt } }
 
 const jsonCache = new Map();
 const CACHE_TTL = 60_000;
