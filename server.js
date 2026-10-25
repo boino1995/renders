@@ -1,4 +1,4 @@
-// server.js - IPTV Proxy Panel with Clean Stream URLs
+// server.js - IPTV Proxy Panel with External JSON Sources
 const express = require('express');
 const fetch = require('node-fetch');
 const { URL } = require('url');
@@ -9,11 +9,13 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // =============================================================
-// In-memory stream store
-// Format: { "name": { url, userAgent?, referer? } }
-// NOTE: resets on restart. For persistence use Render Key Value.
+// In-memory state
 // =============================================================
-let streams = {};
+let streams = {};          // { name: { url, userAgent?, referer? } }  (manual)
+let externalSources = [];  // [ "http://195.154.119.178:8500/files/streams.json", ... ]
+
+const jsonCache = new Map(); // url -> { data, expires }
+const CACHE_TTL = 60_000;    // 60 seconds
 
 // =============================================================
 // Dashboard HTML
@@ -21,148 +23,281 @@ let streams = {};
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>IPTV Proxy Panel</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPTV Proxy Panel</title>
+<script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-900 text-white min-h-screen p-6">
-  <div class="max-w-4xl mx-auto">
-    <h1 class="text-3xl font-bold mb-2 bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">
-      IPTV Proxy Panel
-    </h1>
-    <p class="text-gray-400 mb-6 text-sm">Add a stream URL → get a clean proxy URL you can paste in VLC / TiviMate / Smarters.</p>
+<div class="max-w-5xl mx-auto">
+  <h1 class="text-3xl font-bold mb-2 bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">IPTV Proxy Panel</h1>
+  <p class="text-gray-400 mb-6 text-sm">Add streams manually, or point to a JSON file — every stream gets a clean <code class="text-blue-300">/stream/:name</code> URL.</p>
 
-    <div class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
-      <h2 class="text-xl font-semibold mb-4">Add New Stream</h2>
-      <form id="addForm" class="space-y-3">
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <input id="name" type="text" placeholder="ID (e.g. mbc1)" required
-                 pattern="[a-zA-Z0-9_-]+"
-                 class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-          <input id="url" type="url" placeholder="https://origin.com/stream/index.m3u8" required
-                 class="md:col-span-2 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-        </div>
-        <details class="text-sm text-gray-400">
-          <summary class="cursor-pointer hover:text-gray-300">Advanced (optional headers)</summary>
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
-            <input id="userAgent" type="text" placeholder="Custom User-Agent"
-                   class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none">
-            <input id="referer" type="text" placeholder="Custom Referer"
-                   class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none">
-          </div>
-        </details>
-        <button type="submit"
-                class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-medium transition">
-          Add Stream
-        </button>
-      </form>
-    </div>
-
-    <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
-      <h2 class="text-xl font-semibold mb-4">Your Streams</h2>
-      <div id="streamList" class="space-y-3">
-        <p class="text-gray-400 text-sm">Loading...</p>
+  <!-- Manual stream -->
+  <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
+    <h2 class="text-lg font-semibold mb-4">➕ Add Manual Stream</h2>
+    <form id="addForm" class="space-y-3">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <input id="name" type="text" placeholder="ID (e.g. mbc1)" required pattern="[a-zA-Z0-9_-]+"
+               class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <input id="url" type="url" placeholder="https://origin.com/stream/index.m3u8" required
+               class="md:col-span-2 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
       </div>
+      <details class="text-sm text-gray-400">
+        <summary class="cursor-pointer hover:text-gray-300">Advanced (optional headers)</summary>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+          <input id="userAgent" type="text" placeholder="Custom User-Agent" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+          <input id="referer" type="text" placeholder="Custom Referer" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
+        </div>
+      </details>
+      <button type="submit" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-medium">Add Stream</button>
+    </form>
+  </section>
+
+  <!-- External JSON source -->
+  <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
+    <h2 class="text-lg font-semibold mb-4">🌐 Add External JSON Source</h2>
+    <form id="extForm" class="flex gap-2">
+      <input id="extUrl" type="url" placeholder="https://example.com/streams.json" required
+             class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500">
+      <button type="submit" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-medium">Add Source</button>
+    </form>
+    <p class="text-xs text-gray-500 mt-2">
+      Accepted shapes: <code>{ "name": { "url": "…" } }</code> or <code>[{ "name": "…", "url": "…" }]</code>.
+      Cache refreshes every 60&nbsp;s.
+    </p>
+    <div id="extList" class="mt-4 space-y-2"></div>
+  </section>
+
+  <!-- All streams -->
+  <section class="bg-gray-800 rounded-xl p-6 shadow-lg">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold">📺 All Streams</h2>
+      <button onclick="loadAll()" class="text-sm text-blue-400 hover:text-blue-300">↻ Refresh</button>
     </div>
-  </div>
+    <div id="groups" class="space-y-6">
+      <p class="text-gray-400 text-sm">Loading…</p>
+    </div>
+  </section>
+</div>
 
-  <script>
-    const API_BASE = '/api';
-    const BASE_URL = window.location.origin;
+<script>
+const BASE = window.location.origin;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-    async function loadStreams() {
-      const res = await fetch(API_BASE + '/streams');
-      const data = await res.json();
-      const list = document.getElementById('streamList');
-      const names = Object.keys(data);
-      if (names.length === 0) {
-        list.innerHTML = '<p class="text-gray-400 text-sm">No streams yet. Add one above.</p>';
-        return;
-      }
-      list.innerHTML = names.map(name => {
-        const s = data[name];
-        const proxyUrl = BASE_URL + '/stream/' + encodeURIComponent(name);
-        return \`
-          <div class="bg-gray-700 rounded-lg p-3">
-            <div class="flex items-center justify-between mb-2">
-              <span class="font-semibold text-blue-300">\${name}</span>
-              <button onclick="delStream('\${name}')" class="text-red-400 hover:text-red-300 text-sm">Delete</button>
-            </div>
-            <div class="text-xs text-gray-400 mb-2 truncate">Source: \${escapeHtml(s.url)}</div>
-            <div class="flex gap-2 items-center">
-              <input readonly value="\${proxyUrl}"
-                     class="flex-1 bg-gray-900 text-green-400 text-xs font-mono rounded px-3 py-2 truncate"
-                     onclick="this.select()">
-              <button onclick="copy('\${proxyUrl}', this)"
-                      class="bg-green-600 hover:bg-green-700 px-3 py-2 rounded text-sm font-medium">
-                Copy
-              </button>
-            </div>
-          </div>
-        \`;
-      }).join('');
-    }
+function streamCard(name, s, fromExternal) {
+  const proxyUrl = BASE + '/stream/' + encodeURIComponent(name);
+  const badge = fromExternal
+    ? '<span class="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded">external</span>'
+    : '<span class="text-xs bg-blue-900 text-blue-300 px-2 py-0.5 rounded">manual</span>';
+  const del = fromExternal ? '' :
+    '<button onclick="delStream(\\'' + esc(name) + '\\')" class="text-red-400 hover:text-red-300 text-xs">Delete</button>';
+  return \`
+  <div class="bg-gray-700 rounded-lg p-3">
+    <div class="flex items-center justify-between mb-2">
+      <div class="flex items-center gap-2"><span class="font-semibold text-blue-300">\${esc(name)}</span>\${badge}</div>
+      \${del}
+    </div>
+    <div class="text-xs text-gray-400 mb-2 truncate">Source: \${esc(s.url)}</div>
+    <div class="flex gap-2 items-center">
+      <input readonly value="\${esc(proxyUrl)}" onclick="this.select()"
+             class="flex-1 bg-gray-900 text-green-400 text-xs font-mono rounded px-3 py-2 truncate">
+      <button onclick="copy('\\'' + proxyUrl + '\\'', this)" class="bg-green-600 hover:bg-green-700 px-3 py-2 rounded text-xs font-medium">Copy</button>
+    </div>
+  </div>\`;
+}
 
-    function escapeHtml(s) {
-      return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
+async function loadAll() {
+  const groupsEl = document.getElementById('groups');
+  const extEl = document.getElementById('extList');
 
-    function copy(text, btn) {
-      navigator.clipboard.writeText(text).then(() => {
-        const orig = btn.textContent;
-        btn.textContent = 'Copied!';
-        setTimeout(() => btn.textContent = orig, 1500);
-      });
-    }
+  const [ext, all] = await Promise.all([
+    fetch('/api/external').then(r => r.json()),
+    fetch('/api/all-streams').then(r => r.json()),
+  ]);
 
-    async function delStream(name) {
-      if (!confirm('Delete "' + name + '"?')) return;
-      await fetch(API_BASE + '/streams/' + encodeURIComponent(name), { method: 'DELETE' });
-      loadStreams();
-    }
+  // External sources management panel
+  if (ext.length === 0) {
+    extEl.innerHTML = '<p class="text-gray-500 text-sm">No external sources yet.</p>';
+  } else {
+    extEl.innerHTML = ext.map((u, i) => \`
+      <div class="flex items-center gap-2 bg-gray-700 rounded-lg px-3 py-2">
+        <span class="text-xs text-gray-400">\${i + 1}.</span>
+        <span class="text-sm flex-1 truncate font-mono">\${esc(u)}</span>
+        <button onclick="delExternal(\\'' + encodeURIComponent(u) + '\\')" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+      </div>
+    \`).join('');
+  }
 
-    document.getElementById('addForm').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const body = {
-        name: document.getElementById('name').value.trim(),
-        url: document.getElementById('url').value.trim(),
-        userAgent: document.getElementById('userAgent').value.trim() || undefined,
-        referer: document.getElementById('referer').value.trim() || undefined,
-      };
-      const res = await fetch(API_BASE + '/streams', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        alert('Error: ' + (err.error || res.statusText));
-        return;
-      }
-      document.getElementById('url').value = '';
-      loadStreams();
-    });
+  // Stream groups
+  const sections = [];
+  if (all.manual && Object.keys(all.manual).length > 0) {
+    sections.push(renderGroup('Manual', all.manual, false));
+  }
+  for (const [src, items] of Object.entries(all.external || {})) {
+    sections.push(renderGroup(src, items, true));
+  }
+  groupsEl.innerHTML = sections.length
+    ? sections.join('')
+    : '<p class="text-gray-400 text-sm">No streams configured. Add one above.</p>';
+}
 
-    loadStreams();
-  </script>
-</body>
-</html>`;
+function renderGroup(title, items, fromExternal) {
+  const names = Object.keys(items);
+  const cards = names.map(n => streamCard(n, items[n], fromExternal)).join('');
+  return \`
+    <div>
+      <h3 class="text-sm font-semibold text-gray-400 mb-2 uppercase tracking-wide">
+        \${esc(title)} <span class="text-gray-600">(\${names.length})</span>
+      </h3>
+      <div class="space-y-2">\${cards}</div>
+    </div>\`;
+}
+
+function copy(text, btn) {
+  navigator.clipboard.writeText(text).then(() => {
+    const o = btn.textContent; btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = o, 1200);
+  });
+}
+
+async function delStream(name) {
+  if (!confirm('Delete "' + name + '"?')) return;
+  await fetch('/api/streams/' + encodeURIComponent(name), { method: 'DELETE' });
+  loadAll();
+}
+
+async function delExternal(encodedUrl) {
+  if (!confirm('Remove this external source?')) return;
+  await fetch('/api/external/' + encodedUrl, { method: 'DELETE' });
+  loadAll();
+}
+
+document.getElementById('addForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const body = {
+    name: document.getElementById('name').value.trim(),
+    url: document.getElementById('url').value.trim(),
+    userAgent: document.getElementById('userAgent').value.trim() || undefined,
+    referer: document.getElementById('referer').value.trim() || undefined,
+  };
+  const r = await fetch('/api/streams', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  if (!r.ok) return alert('Error: ' + (await r.json()).error);
+  document.getElementById('url').value = '';
+  loadAll();
+});
+
+document.getElementById('extForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const url = document.getElementById('extUrl').value.trim();
+  const r = await fetch('/api/external', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ url })
+  });
+  if (!r.ok) return alert('Error: ' + (await r.json()).error);
+  document.getElementById('extUrl').value = '';
+  loadAll();
+});
+
+loadAll();
+</script>
+</body></html>`;
 
 // =============================================================
-// API Routes
+// JSON parsing helpers
+// =============================================================
+function normalizeStreams(data) {
+  const out = {};
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      if (!item) continue;
+      const name = item.name || item.id || item.key;
+      const url  = item.url || item.stream_url || item.link || item.hls;
+      if (!name || !url) continue;
+      out[name] = {
+        url,
+        userAgent: item.userAgent || item.ua || item['user-agent'],
+        referer:   item.referer || item.referrer,
+      };
+    }
+    return out;
+  }
+  if (data && typeof data === 'object') {
+    for (const [name, val] of Object.entries(data)) {
+      if (typeof val === 'string') out[name] = { url: val };
+      else if (val && typeof val === 'object' && val.url) {
+        out[name] = { url: val.url, userAgent: val.userAgent || val.ua, referer: val.referer || val.referrer };
+      }
+    }
+  }
+  return out;
+}
+
+async function fetchExternalSource(url) {
+  const now = Date.now();
+  const cached = jsonCache.get(url);
+  if (cached && cached.expires > now) return cached.data;
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'IPTVProxy/1.0', 'Accept': 'application/json' },
+      timeout: 10_000,
+      redirect: 'follow',
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    jsonCache.set(url, { data, expires: now + CACHE_TTL });
+    return data;
+  } catch (err) {
+    if (cached) return cached.data; // serve stale
+    throw err;
+  }
+}
+
+async function findStream(name) {
+  // Manual first
+  if (streams[name]) return { ...streams[name], _origin: 'manual' };
+  // Then each external source
+  for (const src of externalSources) {
+    try {
+      const data = await fetchExternalSource(src);
+      const normalized = normalizeStreams(data);
+      if (normalized[name]) return { ...normalized[name], _origin: src };
+    } catch { /* skip dead source */ }
+  }
+  return null;
+}
+
+async function buildAllStreams() {
+  const result = { manual: {}, external: {} };
+  for (const [n, s] of Object.entries(streams)) {
+    result.manual[n] = { url: s.url };
+  }
+  for (const src of externalSources) {
+    try {
+      const data = await fetchExternalSource(src);
+      const normalized = normalizeStreams(data);
+      // Strip names already provided manually
+      for (const n of Object.keys(normalized)) {
+        if (!streams[n]) {
+          result.external[src] = result.external[src] || {};
+          result.external[src][n] = normalized[n];
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  return result;
+}
+
+// =============================================================
+// API: manual streams
 // =============================================================
 app.get('/api/streams', (req, res) => res.json(streams));
 
 app.post('/api/streams', (req, res) => {
   const { name, url, userAgent, referer } = req.body;
-  if (!name || !url) return res.status(400).json({ error: 'name and url are required' });
-  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
-    return res.status(400).json({ error: 'name can only contain letters, numbers, _ and -' });
-  }
-  try { new URL(url); } catch {
-    return res.status(400).json({ error: 'url is not valid' });
-  }
+  if (!name || !url) return res.status(400).json({ error: 'name and url required' });
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({ error: 'invalid name' });
+  try { new URL(url); } catch { return res.status(400).json({ error: 'invalid url' }); }
   streams[name] = { url, userAgent, referer };
   res.json({ success: true });
 });
@@ -173,108 +308,125 @@ app.delete('/api/streams/:name', (req, res) => {
 });
 
 // =============================================================
-// Clean Stream Proxy:  GET /stream/:name
+// API: external sources
+// =============================================================
+app.get('/api/external', (req, res) => res.json(externalSources));
+
+app.post('/api/external', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try { new URL(url); } catch { return res.status(400).json({ error: 'invalid url' }); }
+  if (externalSources.includes(url)) return res.status(400).json({ error: 'already added' });
+  // Verify the URL is fetchable and JSON before saving
+  try {
+    const data = await fetchExternalSource(url);
+    const count = Object.keys(normalizeStreams(data)).length;
+    if (count === 0) return res.status(400).json({ error: 'JSON has no recognizable streams' });
+  } catch (err) {
+    return res.status(400).json({ error: 'cannot fetch JSON: ' + err.message });
+  }
+  externalSources.push(url);
+  res.json({ success: true });
+});
+
+app.delete('/api/external/:url', (req, res) => {
+  const url = decodeURIComponent(req.params.url);
+  externalSources = externalSources.filter(u => u !== url);
+  jsonCache.delete(url);
+  res.json({ success: true });
+});
+
+// =============================================================
+// API: merged view for dashboard
+// =============================================================
+app.get('/api/all-streams', async (req, res) => {
+  res.json(await buildAllStreams());
+});
+
+// =============================================================
+// Clean entry point:  /stream/:name
 // =============================================================
 app.get('/stream/:name', async (req, res) => {
-  const stream = streams[req.params.name];
+  const stream = await findStream(req.params.name);
   if (!stream) return res.status(404).send('Stream not found');
   await proxyHandler(req, res, stream.url, stream);
 });
 
 // =============================================================
-// Segment / Sub-playlist Proxy:  GET /proxy?url=...
+// Internal proxy for segments / sub-playlists
 // =============================================================
 app.get('/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Missing url parameter');
-  await proxyHandler(req, res, targetUrl, {});
+  // Carry optional per-stream headers through via query params
+  await proxyHandler(req, res, targetUrl, {
+    userAgent: req.query.ua,
+    referer:   req.query.rf,
+  });
 });
 
 // =============================================================
 // Shared proxy handler
 // =============================================================
 async function proxyHandler(req, res, targetUrl, opts) {
-  const headers = {
-    'User-Agent': opts.userAgent || 'Mozilla/5.0 (compatible; IPTVProxy/1.0)',
-  };
+  const headers = { 'User-Agent': opts.userAgent || 'Mozilla/5.0 (compatible; IPTVProxy/1.0)' };
   if (opts.referer) headers['Referer'] = opts.referer;
   if (req.headers.range) headers['Range'] = req.headers.range;
 
   try {
-    const upstream = await fetch(targetUrl, {
-      headers,
-      redirect: 'follow',
-      timeout: 20000,
-    });
-
+    const upstream = await fetch(targetUrl, { headers, redirect: 'follow', timeout: 20_000 });
     if (!upstream.ok && upstream.status !== 206) {
-      return res.status(upstream.status).send('Upstream error: ' + upstream.status);
+      return res.status(upstream.status).send('Upstream ' + upstream.status);
     }
-
-    const contentType = upstream.headers.get('content-type') || '';
+    const ct = upstream.headers.get('content-type') || '';
     const finalUrl = upstream.url || targetUrl;
-    const isM3U8 = contentType.includes('mpegurl') || finalUrl.split('?')[0].endsWith('.m3u8');
+    const isM3U8 = ct.includes('mpegurl') || finalUrl.split('?')[0].endsWith('.m3u8');
 
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache');
 
     if (isM3U8) {
       const text = await upstream.text();
-      const baseUrl = new URL(finalUrl);
+      // Preserve headers on rewritten URLs
+      const qs = new URLSearchParams();
+      if (opts.userAgent) qs.set('ua', opts.userAgent);
+      if (opts.referer)   qs.set('rf', opts.referer);
+      const suffix = qs.toString() ? '&' + qs.toString() : '';
       const proxyBase = `${req.protocol}://${req.get('host')}/proxy?url=`;
-      const rewritten = rewriteM3U8(text, baseUrl, proxyBase);
+      const rewritten = rewriteM3U8(text, new URL(finalUrl), proxyBase, suffix);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       return res.send(rewritten);
     }
 
-    // Binary — stream through, preserving Range/Content-Length for seeking
+    // Binary stream
     res.status(upstream.status);
-    res.setHeader('Content-Type', contentType || 'application/octet-stream');
-    const ar = upstream.headers.get('accept-ranges');
-    const cr = upstream.headers.get('content-range');
-    const cl = upstream.headers.get('content-length');
-    if (ar) res.setHeader('Accept-Ranges', ar);
-    if (cr) res.setHeader('Content-Range', cr);
-    if (cl) res.setHeader('Content-Length', cl);
+    res.setHeader('Content-Type', ct || 'application/octet-stream');
+    for (const h of ['accept-ranges', 'content-range', 'content-length']) {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h.split('-').map(s => s[0].toUpperCase() + s.slice(1)).join('-'), v);
+    }
     upstream.body.pipe(res);
   } catch (err) {
     res.status(502).send('Proxy error: ' + err.message);
   }
 }
 
-// =============================================================
-// M3U8 rewriter — handles segments, sub-playlists, keys, maps, media
-// =============================================================
-function rewriteM3U8(text, baseUrl, proxyBase) {
-  return text.split('\n').map(rawLine => {
-    const line = rawLine.trim();
-    if (!line) return rawLine;
-
-    // Rewrite URI="..." inside #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA
+function rewriteM3U8(text, baseUrl, proxyBase, suffix) {
+  return text.split('\n').map(raw => {
+    const line = raw.trim();
+    if (!line) return raw;
     if (line.startsWith('#EXT-X-KEY') || line.startsWith('#EXT-X-MAP') || line.startsWith('#EXT-X-MEDIA')) {
       return line.replace(/URI="([^"]+)"/g, (m, uri) => {
-        try {
-          const abs = new URL(uri, baseUrl).href;
-          return `URI="${proxyBase}${encodeURIComponent(abs)}"`;
-        } catch { return m; }
+        try { return `URI="${proxyBase}${encodeURIComponent(new URL(uri, baseUrl).href)}${suffix}"`; }
+        catch { return m; }
       });
     }
-
-    if (line.startsWith('#')) return rawLine;
-
-    // Segment or sub-playlist URL
-    try {
-      const abs = new URL(line, baseUrl).href;
-      return proxyBase + encodeURIComponent(abs);
-    } catch {
-      return rawLine;
-    }
+    if (line.startsWith('#')) return raw;
+    try { return proxyBase + encodeURIComponent(new URL(line, baseUrl).href) + suffix; }
+    catch { return raw; }
   }).join('\n');
 }
 
 // =============================================================
-// Dashboard root
-// =============================================================
 app.get('/', (req, res) => res.send(dashboardHTML));
-
-app.listen(PORT, () => console.log(`IPTV Proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log('IPTV Proxy running on ' + PORT));
