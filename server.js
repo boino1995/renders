@@ -1,561 +1,504 @@
-// server.js - IPTV Panel with Xtream Codes users (all streams for every user)
-const express = require('express');
-const fetch = require('node-fetch');
-const { URL } = require('url');
-const app = express();
-const PORT = process.env.PORT || 3000;
+// server.js — ClusterCore port (single file, ESM)
+import express from "express";
+import path from "path";
+import fs from "fs";
+import cors from "cors";
+import morgan from "morgan";
+import axios from "axios";
+import crypto from "crypto";
+import { spawn } from "child_process";
+import Database from "better-sqlite3";
+import { fileURLToPath } from "url";
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 
-// =============================================================
-// In-memory state
-// =============================================================
-let streams = {};            // { name: { url, userAgent?, referer? } }
-let externalSources = ["http://195.154.119.178:8500/files/streams.json"];    // [ "http://195.154.119.178:8500/files/streams.json", ... ]
-let users = {"ssss":{"password":"ssss","createdAt":1792966152}};              // { username: { password, createdAt } }
+const PORT     = process.env.PORT || 3000;
+const DB_PATH  = process.env.DB_PATH || path.join(__dirname, "data", "cluster.db");
+const DATA_DIR = path.dirname(DB_PATH);
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const jsonCache = new Map();
-const CACHE_TTL = 60_000;
+const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
 
-const now = () => Math.floor(Date.now() / 1000);
-
-// =============================================================
+// -------------------------------------------------------------
 // Helpers
-// =============================================================
-function normalizeStreams(data) {
-  const out = {};
-  if (Array.isArray(data)) {
-    for (const item of data) {
-      if (!item) continue;
-      const name = item.name || item.id || item.key;
-      const url  = item.url || item.stream_url || item.link || item.hls;
-      if (name && url) out[name] = {
-        url,
-        userAgent: item.userAgent || item.ua || item['user-agent'],
-        referer:   item.referer   || item.referrer,
-      };
-    }
-    return out;
-  }
-  if (data && typeof data === 'object') {
-    for (const [name, val] of Object.entries(data)) {
-      if (typeof val === 'string') out[name] = { url: val };
-      else if (val && val.url) out[name] = {
-        url: val.url,
-        userAgent: val.userAgent || val.ua,
-        referer:   val.referer   || val.referrer,
-      };
-    }
-  }
-  return out;
-}
-
-async function fetchExternalSource(url) {
-  const cached = jsonCache.get(url);
-  if (cached && cached.expires > Date.now()) return cached.data;
+// -------------------------------------------------------------
+function auditLog(level, message) {
   try {
-    const res = await fetch(url, { headers: { 'User-Agent': 'IPTVProxy/1.0' }, timeout: 10_000 });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    jsonCache.set(url, { data, expires: Date.now() + CACHE_TTL });
-    return data;
-  } catch (err) {
-    if (cached) return cached.data; // serve stale
-    throw err;
-  }
+    db.prepare("INSERT INTO audit_logs (level, message) VALUES (?, ?)").run(level, message);
+  } catch { /* ignore */ }
 }
 
-async function getAllStreams() {
-  const all = { ...streams };
-  for (const src of externalSources) {
+function syncJson(filename, data) {
+  const jsonStr = JSON.stringify(data, null, 2);
+  const localPath = path.join(DATA_DIR, filename);
+  try { fs.writeFileSync(localPath, jsonStr); } catch (e) { console.error("sync local:", e.message); }
+  const ext = process.env.EXTERNAL_JSON_PATH;
+  if (ext) {
     try {
-      const data = await fetchExternalSource(src);
-      const normalized = normalizeStreams(data);
-      for (const [name, s] of Object.entries(normalized)) {
-        if (!all[name]) all[name] = s; // manual wins
-      }
-    } catch { /* skip dead source */ }
+      if (!fs.existsSync(ext)) fs.mkdirSync(ext, { recursive: true });
+      fs.writeFileSync(path.join(ext, filename), jsonStr);
+    } catch (e) { console.error("sync external:", e.message); }
   }
-  return all;
 }
 
-async function findStream(name) {
-  const all = await getAllStreams();
-  return all[name] || null;
+// -------------------------------------------------------------
+// Schema
+// -------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS streams (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    node TEXT,
+    profile TEXT,
+    category TEXT DEFAULT 'Uncategorized',
+    logo TEXT,
+    headers TEXT DEFAULT '{}',
+    status TEXT DEFAULT 'offline',
+    last_check DATETIME
+  );
+  CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL, url TEXT NOT NULL, token TEXT
+  );
+  CREATE TABLE IF NOT EXISTS profiles (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+    args TEXT DEFAULT '[]', logo TEXT
+  );
+  CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY, password TEXT NOT NULL,
+    status TEXT DEFAULT 'Active', exp_date TEXT
+  );
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    level TEXT, message TEXT
+  );
+  CREATE TABLE IF NOT EXISTS category_logos (
+    category TEXT PRIMARY KEY, logo_url TEXT NOT NULL
+  );
+`);
+
+// Migrations (idempotent)
+for (const col of ["category", "logo"]) {
+  try { db.prepare(`SELECT ${col} FROM streams LIMIT 1`).get(); }
+  catch { db.exec(`ALTER TABLE streams ADD COLUMN ${col} TEXT`); }
 }
 
-// =============================================================
-// Dashboard HTML
-// =============================================================
-const dashboardHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IPTV Panel · Xtream Codes</title>
-<script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-900 text-white min-h-screen p-6">
-<div class="max-w-6xl mx-auto">
-  <h1 class="text-3xl font-bold mb-2 bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">IPTV Panel</h1>
-  <p class="text-gray-400 mb-6 text-sm">Xtream Codes–compatible · Every user gets every stream automatically.</p>
+// -------------------------------------------------------------
+// M3U fetch (from external source, refreshed every 30s)
+// -------------------------------------------------------------
+let m3uFetchInterval = null;
 
-  <div class="flex gap-2 mb-6 border-b border-gray-700 pb-2">
-    <button onclick="showTab('streams')" id="tab-streams" class="px-4 py-2 rounded-t font-medium bg-blue-600">Streams</button>
-    <button onclick="showTab('users')"   id="tab-users"   class="px-4 py-2 rounded-t font-medium text-gray-400 hover:text-white">Users</button>
-  </div>
-
-  <!-- Streams Tab -->
-  <div id="pane-streams">
-    <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
-      <h2 class="text-lg font-semibold mb-4">➕ Add Manual Stream</h2>
-      <form id="addStreamForm" class="space-y-3">
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <input id="sName" type="text" placeholder="ID (e.g. mbc1)" required pattern="[a-zA-Z0-9_-]+" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-          <input id="sUrl" type="url" placeholder="https://origin.com/stream/index.m3u8" required class="md:col-span-2 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-        </div>
-        <details class="text-sm text-gray-400">
-          <summary class="cursor-pointer">Advanced headers</summary>
-          <div class="grid grid-cols-2 gap-3 mt-2">
-            <input id="sUA"  type="text" placeholder="User-Agent" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-            <input id="sRef" type="text" placeholder="Referer"   class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-          </div>
-        </details>
-        <button type="submit" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-medium">Add Stream</button>
-      </form>
-    </section>
-
-    <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
-      <h2 class="text-lg font-semibold mb-4">🌐 External JSON Sources</h2>
-      <form id="extForm" class="flex gap-2 mb-3">
-        <input id="extUrl" type="url" placeholder="https://example.com/streams.json" required class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-        <button type="submit" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-medium">Add Source</button>
-      </form>
-      <div id="extList" class="space-y-2 text-sm"></div>
-    </section>
-
-    <section class="bg-gray-800 rounded-xl p-6 shadow-lg">
-      <div class="flex justify-between items-center mb-4">
-        <h2 class="text-lg font-semibold">📺 All Streams (<span id="streamCount">0</span>)</h2>
-        <button onclick="loadStreams()" class="text-sm text-blue-400 hover:text-blue-300">↻ Refresh</button>
-      </div>
-      <div id="streamList" class="space-y-2"></div>
-    </section>
-  </div>
-
-  <!-- Users Tab -->
-  <div id="pane-users" class="hidden">
-    <section class="bg-gray-800 rounded-xl p-6 shadow-lg mb-6">
-      <h2 class="text-lg font-semibold mb-4">➕ Create User</h2>
-      <p class="text-sm text-gray-400 mb-3">Every user gets access to <b class="text-white">all streams</b> automatically.</p>
-      <form id="userForm" class="space-y-3">
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <input id="uName" type="text" placeholder="Username" required class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-          <input id="uPass" type="text" placeholder="Password" required class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2">
-        </div>
-        <button type="submit" class="bg-purple-600 hover:bg-purple-700 px-6 py-2 rounded-lg font-medium">Create User</button>
-      </form>
-    </section>
-
-    <section class="bg-gray-800 rounded-xl p-6 shadow-lg">
-      <div class="flex justify-between items-center mb-4">
-        <h2 class="text-lg font-semibold">👥 Users (<span id="userCount">0</span>)</h2>
-        <button onclick="loadUsers()" class="text-sm text-blue-400 hover:text-blue-300">↻ Refresh</button>
-      </div>
-      <div id="userList" class="space-y-3"></div>
-    </section>
-  </div>
-</div>
-
-<script>
-const BASE = window.location.origin;
-const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-function showTab(t) {
-  ['streams','users'].forEach(x => {
-    document.getElementById('pane-' + x).classList.toggle('hidden', x !== t);
-    document.getElementById('tab-' + x).className = 'px-4 py-2 rounded-t font-medium ' + (x === t ? 'bg-blue-600' : 'text-gray-400 hover:text-white');
-  });
-  if (t === 'users') loadUsers();
-}
-
-async function loadStreams() {
-  const [manual, external, all] = await Promise.all([
-    fetch('/api/streams').then(r => r.json()),
-    fetch('/api/external').then(r => r.json()),
-    fetch('/api/all-streams').then(r => r.json()),
-  ]);
-
-  document.getElementById('extList').innerHTML = external.length
-    ? external.map(u => \`<div class="flex items-center gap-2 bg-gray-700 rounded px-3 py-1">
-        <span class="flex-1 truncate font-mono text-xs">\${esc(u)}</span>
-        <button onclick="delExt('\${encodeURIComponent(u)}')" class="text-red-400 text-xs">Remove</button>
-      </div>\`).join('')
-    : '<p class="text-gray-500 text-sm">None added.</p>';
-
-  const names = Object.keys(all);
-  document.getElementById('streamCount').textContent = names.length;
-  document.getElementById('streamList').innerHTML = names.length
-    ? names.map(n => {
-        const s = all[n];
-        const isManual = !!manual[n];
-        return \`<div class="bg-gray-700 rounded p-3">
-          <div class="flex justify-between items-center mb-1">
-            <div class="flex items-center gap-2">
-              <span class="font-semibold text-blue-300">\${esc(n)}</span>
-              <span class="text-xs \${isManual ? 'bg-blue-900 text-blue-300' : 'bg-green-900 text-green-300'} px-2 py-0.5 rounded">\${isManual ? 'manual' : 'external'}</span>
-            </div>
-            \${isManual ? \`<button onclick="delStream('\${esc(n)}')" class="text-red-400 text-xs">Delete</button>\` : ''}
-          </div>
-          <div class="text-xs text-gray-400 truncate mb-1">\${esc(s.url)}</div>
-          <input readonly value="\${BASE}/stream/\${encodeURIComponent(n)}" onclick="this.select()" class="w-full bg-gray-900 text-green-400 text-xs font-mono rounded px-2 py-1">
-        </div>\`;
-      }).join('')
-    : '<p class="text-gray-500 text-sm">No streams yet.</p>';
-}
-
-async function delStream(name) {
-  if (!confirm('Delete "' + name + '"?')) return;
-  await fetch('/api/streams/' + encodeURIComponent(name), { method: 'DELETE' });
-  loadStreams();
-}
-async function delExt(enc) {
-  if (!confirm('Remove this source?')) return;
-  await fetch('/api/external/' + enc, { method: 'DELETE' });
-  loadStreams();
-}
-
-document.getElementById('addStreamForm').onsubmit = async e => {
-  e.preventDefault();
-  const body = {
-    name: sName.value.trim(), url: sUrl.value.trim(),
-    userAgent: sUA.value.trim() || undefined, referer: sRef.value.trim() || undefined,
-  };
-  const r = await fetch('/api/streams', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (!r.ok) return alert((await r.json()).error);
-  sUrl.value = ''; sUA.value = ''; sRef.value = '';
-  loadStreams();
-};
-document.getElementById('extForm').onsubmit = async e => {
-  e.preventDefault();
-  const r = await fetch('/api/external', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ url: extUrl.value.trim() }) });
-  if (!r.ok) return alert((await r.json()).error);
-  extUrl.value = ''; loadStreams();
-};
-
-async function loadUsers() {
-  const usersData = await fetch('/api/users').then(r => r.json());
-  const keys = Object.keys(usersData);
-  document.getElementById('userCount').textContent = keys.length;
-  const list = document.getElementById('userList');
-
-  if (keys.length === 0) {
-    list.innerHTML = '<p class="text-gray-500 text-sm">No users yet.</p>';
-    return;
-  }
-
-  list.innerHTML = keys.map(u => {
-    const data = usersData[u];
-    const playlistUrl = \`\${BASE}/get.php?username=\${encodeURIComponent(u)}&password=\${encodeURIComponent(data.password)}&type=m3u_plus&output=ts\`;
-    return \`<div class="bg-gray-700 rounded p-4">
-      <div class="flex justify-between items-center mb-2">
-        <div>
-          <span class="font-bold text-purple-300">\${esc(u)}</span>
-          <span class="text-xs text-gray-400 ml-2">pass: \${esc(data.password)}</span>
-        </div>
-        <button onclick="delUser('\${esc(u)}')" class="text-red-400 text-sm">Delete</button>
-      </div>
-
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs mb-2">
-        <div class="bg-gray-900 rounded p-2">
-          <div class="text-gray-500 mb-1">Server URL</div>
-          <div class="font-mono text-blue-300 truncate" title="\${BASE}">\${BASE}</div>
-        </div>
-        <div class="bg-gray-900 rounded p-2">
-          <div class="text-gray-500 mb-1">Username</div>
-          <div class="font-mono text-blue-300 truncate">\${esc(u)}</div>
-        </div>
-        <div class="bg-gray-900 rounded p-2">
-          <div class="text-gray-500 mb-1">Password</div>
-          <div class="font-mono text-blue-300 truncate">\${esc(data.password)}</div>
-        </div>
-      </div>
-
-      <div class="flex gap-2 items-center">
-        <input readonly value="\${playlistUrl}" onclick="this.select()" class="flex-1 bg-gray-900 text-green-400 text-xs font-mono rounded px-2 py-1 truncate">
-        <button onclick="copy('\${playlistUrl}', this)" class="bg-green-600 hover:bg-green-700 px-3 py-1 rounded text-xs">Copy M3U</button>
-      </div>
-      <p class="text-xs text-gray-500 mt-2">Works with TiviMate, IPTV Smarters, OTT Navigator — choose "Xtream Codes API".</p>
-    </div>\`;
-  }).join('');
-}
-
-document.getElementById('userForm').onsubmit = async e => {
-  e.preventDefault();
-  const body = { username: uName.value.trim(), password: uPass.value.trim() };
-  const r = await fetch('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  if (!r.ok) return alert((await r.json()).error);
-  uName.value = ''; uPass.value = '';
-  loadUsers();
-};
-
-async function delUser(name) {
-  if (!confirm('Delete user "' + name + '"?')) return;
-  await fetch('/api/users/' + encodeURIComponent(name), { method: 'DELETE' });
-  loadUsers();
-}
-
-function copy(text, btn) {
-  navigator.clipboard.writeText(text).then(() => {
-    const o = btn.textContent; btn.textContent = 'Copied!';
-    setTimeout(() => btn.textContent = o, 1200);
-  });
-}
-
-loadStreams();
-showTab('streams');
-</script>
-</body></html>`;
-
-// =============================================================
-// API: Streams
-// =============================================================
-app.get('/api/streams', (req, res) => res.json(streams));
-app.post('/api/streams', (req, res) => {
-  const { name, url, userAgent, referer } = req.body;
-  if (!name || !url) return res.status(400).json({ error: 'name and url required' });
-  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({ error: 'invalid name (only a-z, A-Z, 0-9, _ and -)' });
-  try { new URL(url); } catch { return res.status(400).json({ error: 'invalid url' }); }
-  streams[name] = { url, userAgent, referer };
-  res.json({ success: true });
-});
-app.delete('/api/streams/:name', (req, res) => { delete streams[req.params.name]; res.json({ success: true }); });
-
-app.get('/api/external', (req, res) => res.json(externalSources));
-app.post('/api/external', async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'url required' });
-  try { new URL(url); } catch { return res.status(400).json({ error: 'invalid url' }); }
-  if (externalSources.includes(url)) return res.status(400).json({ error: 'already added' });
+async function fetchExternalM3U() {
+  const url = process.env.M3U_SOURCE_URL;
+  if (!url) return;
+  console.log(`[M3U] fetching ${url}`);
   try {
-    const data = await fetchExternalSource(url);
-    if (Object.keys(normalizeStreams(data)).length === 0) return res.status(400).json({ error: 'no recognizable streams in JSON' });
-  } catch (err) { return res.status(400).json({ error: 'cannot fetch: ' + err.message }); }
-  externalSources.push(url);
-  res.json({ success: true });
-});
-app.delete('/api/external/:url', (req, res) => {
-  const url = decodeURIComponent(req.params.url);
-  externalSources = externalSources.filter(u => u !== url);
-  jsonCache.delete(url);
-  res.json({ success: true });
-});
+    const resp = await axios.get(url, { timeout: 30000, responseType: "text" });
+    const content = typeof resp.data === "string" ? resp.data : String(resp.data);
+    const lines = content.split(/\r?\n/);
 
-app.get('/api/all-streams', async (req, res) => res.json(await getAllStreams()));
+    const fetched = [];
+    let cur = null, idCounter = 600;
 
-// =============================================================
-// API: Users
-// =============================================================
-app.get('/api/users', (req, res) => res.json(users));
-app.post('/api/users', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (!/^[a-zA-Z0-9_-]+$/.test(username)) return res.status(400).json({ error: 'username: only a-z, A-Z, 0-9, _ and -' });
-  if (users[username]) return res.status(400).json({ error: 'user already exists' });
-  users[username] = { password, createdAt: now() };
-  res.json({ success: true });
-});
-app.delete('/api/users/:name', (req, res) => {
-  delete users[req.params.name];
-  res.json({ success: true });
-});
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith("#EXTINF:")) {
+        cur = {
+          name: (line.match(/,(.*)$/) || [, "Unnamed"])[1].trim(),
+          category: (line.match(/group-title="([^"]*)"/) || [, "Uncategorized"])[1],
+          logo: (line.match(/tvg-logo="([^"]*)"/) || [, null])[1],
+          id: (line.match(/tvg-id="([^"]*)"/) || [, null])[1],
+        };
+      } else if (!line.startsWith("#") && cur) {
+        cur.url = line;
+        cur.id = cur.id || (idCounter <= 900 ? String(idCounter++) : crypto.createHash("md5").update(line).digest("hex").slice(0, 16));
+        fetched.push(cur);
+        cur = null;
+      }
+    }
 
-// =============================================================
-// XTREAM CODES COMPATIBLE ENDPOINTS
-// =============================================================
-
-// ---------- player_api.php ----------
-app.all('/player_api.php', async (req, res) => {
-  const { username, password, action } = { ...req.query, ...req.body };
-  const user = users[username];
-
-  if (!user || user.password !== password) {
-    return res.status(401).json({ user_info: { auth: 0 } });
+    if (fetched.length > 0) {
+      const stmt = db.prepare("INSERT OR REPLACE INTO streams (id, name, url, category, logo, headers, status) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      db.transaction(() => {
+        for (const s of fetched) stmt.run(s.id, s.name, s.url, s.category, s.logo, "{}", "online");
+      })();
+      const all = db.prepare("SELECT id, name, url, node, profile, category, headers FROM streams").all();
+      syncJson("streams.json", all);
+      auditLog("SYSTEM", `Auto-fetched ${fetched.length} streams from M3U`);
+    }
+  } catch (e) {
+    console.error("[M3U] error:", e.message);
   }
+}
 
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
+// -------------------------------------------------------------
+// Express app
+// -------------------------------------------------------------
+const app = express();
+app.use(cors());
+app.use(morgan("dev"));
+app.use(express.json({ limit: "50mb" }));
 
-  if (!action || action === 'get_account_info') {
+// --- Auth middleware ---
+const adminAuth = (req, res, next) => {
+  const pass = process.env.ADMIN_PASSWORD || "admin";
+  if (req.headers["x-admin-auth"] === pass) return next();
+  res.status(403).json({ status: "error", message: "Admin access required" });
+};
+
+const clientAuth = (req, res, next) => {
+  const hdr = req.headers["x-client-auth"];
+  if (!hdr) return res.status(403).json({ status: "error", message: "Client access required" });
+  try {
+    const [u, p] = Buffer.from(hdr, "base64").toString().split(":");
+    const user = db.prepare("SELECT * FROM users WHERE username = ? AND password = ?").get(u, p);
+    if (!user) return res.status(403).json({ status: "error", message: "Invalid client credentials" });
+    req.user = user;
+    next();
+  } catch {
+    res.status(403).json({ status: "error", message: "Invalid auth format" });
+  }
+};
+
+// --- Auth endpoints ---
+app.post("/api/admin/login", (req, res) => {
+  const { username, password } = req.body;
+  if (username === (process.env.ADMIN_USERNAME || "admin") && password === (process.env.ADMIN_PASSWORD || "admin")) {
+    auditLog("SECURITY", `Admin login: ${username}`);
+    return res.json({ status: "success", user: { username, token: process.env.ADMIN_PASSWORD || "admin" } });
+  }
+  auditLog("SECURITY", `Failed admin login: ${username}`);
+  res.status(401).json({ status: "error", message: "Invalid admin credentials" });
+});
+
+app.post("/api/client/login", (req, res) => {
+  const { username, password } = req.body;
+  const user = db.prepare("SELECT * FROM users WHERE username = ? AND password = ?").get(username, password);
+  if (!user) return res.status(401).json({ status: "error", message: "Invalid credentials" });
+  if (user.status !== "Active") return res.status(403).json({ status: "error", message: `Account is ${user.status}` });
+  const token = Buffer.from(`${username}:${password}`).toString("base64");
+  auditLog("SECURITY", `Client login: ${username}`);
+  res.json({ status: "success", user: { ...user, token } });
+});
+
+app.post("/api/logout", (req, res) => {
+  const { username, role } = req.body || {};
+  auditLog("SECURITY", `${role === "admin" ? "Admin" : "Client"} logout: ${username}`);
+  res.json({ status: "success" });
+});
+
+// --- Client-facing ---
+app.get("/api/client/streams", clientAuth, (req, res) => {
+  res.json(db.prepare("SELECT id, name, category, status, logo FROM streams").all());
+});
+
+// --- Streams (admin) ---
+app.get("/api/streams", adminAuth, (req, res) => {
+  const rows = db.prepare("SELECT * FROM streams").all();
+  res.json(rows.map(s => {
+    let headers = {};
+    try { headers = s.headers ? JSON.parse(s.headers) : {}; } catch {}
+    return { ...s, headers };
+  }));
+});
+
+app.post("/api/streams", adminAuth, (req, res) => {
+  const streams = req.body;
+  const ins = db.prepare("INSERT INTO streams (id, name, url, node, profile, category, logo, headers) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+  db.transaction(() => {
+    db.prepare("DELETE FROM streams").run();
+    for (const s of streams) {
+      let headers = s.headers || {};
+      if (typeof headers === "string") { try { headers = JSON.parse(headers); } catch { headers = {}; } }
+      ins.run(s.id, s.name, s.url, s.node, s.profile, s.category || "Uncategorized", s.logo || null, JSON.stringify(headers));
+    }
+  })();
+  syncJson("streams.json", streams.map(({ status, last_check, ...r }) => r));
+  auditLog("INFO", `Updated streams (${streams.length})`);
+  res.json({ status: "success" });
+});
+
+app.post("/api/streams/fetch", adminAuth, async (req, res) => {
+  await fetchExternalM3U();
+  res.json({ message: "M3U fetch triggered" });
+});
+
+// --- Category logos ---
+app.get("/api/category-logos", adminAuth, (req, res) => res.json(db.prepare("SELECT * FROM category_logos").all()));
+app.post("/api/category-logos", adminAuth, (req, res) => {
+  db.prepare("INSERT OR REPLACE INTO category_logos (category, logo_url) VALUES (?, ?)").run(req.body.category, req.body.logo_url);
+  res.json({ status: "success" });
+});
+
+// --- Nodes ---
+app.get("/api/nodes", adminAuth, (req, res) => res.json(db.prepare("SELECT * FROM nodes").all()));
+app.post("/api/nodes", adminAuth, (req, res) => {
+  const nodes = req.body;
+  db.transaction(() => {
+    db.prepare("DELETE FROM nodes").run();
+    const ins = db.prepare("INSERT INTO nodes (name, url, token) VALUES (?, ?, ?)");
+    for (const n of nodes) ins.run(n.name, n.url, n.token);
+  })();
+  syncJson("nodes.json", nodes);
+  res.json({ status: "success" });
+});
+
+// --- Profiles ---
+app.get("/api/profiles", adminAuth, (req, res) => {
+  const rows = db.prepare("SELECT * FROM profiles").all();
+  res.json(rows.map(p => { let args = []; try { args = p.args ? JSON.parse(p.args) : []; } catch {} return { ...p, args }; }));
+});
+app.post("/api/profiles", adminAuth, (req, res) => {
+  const profiles = req.body;
+  db.transaction(() => {
+    db.prepare("DELETE FROM profiles").run();
+    const ins = db.prepare("INSERT INTO profiles (id, name, args, logo) VALUES (?, ?, ?, ?)");
+    for (const p of profiles) {
+      let args = p.args || [];
+      if (typeof args === "string") { try { args = JSON.parse(args); } catch { args = []; } }
+      ins.run(p.id, p.name, JSON.stringify(args), p.logo || null);
+    }
+  })();
+  syncJson("profiles.json", profiles);
+  res.json({ status: "success" });
+});
+
+// --- Users ---
+app.get("/api/users", adminAuth, (req, res) => res.json(db.prepare("SELECT * FROM users").all()));
+app.post("/api/users", adminAuth, (req, res) => {
+  const users = req.body;
+  db.transaction(() => {
+    db.prepare("DELETE FROM users").run();
+    const ins = db.prepare("INSERT INTO users (username, password, status, exp_date) VALUES (?, ?, ?, ?)");
+    for (const u of users) ins.run(u.username, u.password, u.status || "Active", u.exp_date || null);
+  })();
+  syncJson("users.json", users);
+  res.json({ status: "success" });
+});
+
+// --- Audit logs ---
+app.get("/api/logs", adminAuth, (req, res) => {
+  res.json(db.prepare("SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 100").all());
+});
+
+// --- Health checks ---
+app.get("/api/check-health/:id", adminAuth, async (req, res) => {
+  const stream = db.prepare("SELECT * FROM streams WHERE id = ?").get(req.params.id);
+  if (!stream) return res.json({ status: "offline", msg: "Stream not found" });
+  if (!stream.node) {
+    try {
+      const head = await axios.head(stream.url, { timeout: 2000 });
+      return res.json({ status: head.status < 400 ? "online" : "offline", viewers: 0 });
+    } catch { return res.json({ status: "offline" }); }
+  }
+  const node = db.prepare("SELECT * FROM nodes WHERE url = ?").get(stream.node);
+  if (!node) return res.json({ status: "offline", msg: "Node not found" });
+  try {
+    const r = await axios.get(`${node.url}/api/node_status/${stream.id}`, {
+      headers: { Authorization: `Bearer ${node.token || ""}`, "X-Panel-Secret": "ClusterX-Core" },
+      timeout: 3000,
+    });
+    res.json({ status: r.data.active ? "online" : "offline", viewers: r.data.clients || 0 });
+  } catch (e) { res.json({ status: "offline", error: e.message }); }
+});
+
+app.get("/api/node-health/:id", adminAuth, async (req, res) => {
+  const node = db.prepare("SELECT * FROM nodes WHERE id = ?").get(req.params.id);
+  if (!node) return res.status(404).json({ status: "offline", error: "Node not found" });
+  try {
+    const r = await axios.get(`${node.url}/health`, {
+      headers: { Authorization: `Bearer ${node.token || ""}`, "X-Panel-Secret": "ClusterX-Core" },
+      timeout: 5000,
+    });
+    res.json({ status: "online", details: r.data });
+  } catch (e) { res.json({ status: "offline", error: e.message }); }
+});
+
+// -------------------------------------------------------------
+// Xtream Codes API
+// -------------------------------------------------------------
+app.get("/player_api.php", (req, res) => {
+  const { username, password, action, category_id } = req.query;
+  const user = db.prepare("SELECT * FROM users WHERE username = ? AND password = ?").get(username, password);
+  if (!user) return res.json({ user_info: { auth: 0, status: "Invalid" } });
+
+  const streams = db.prepare("SELECT * FROM streams").all();
+  const categories = [...new Set(streams.map(s => s.category || "Uncategorized"))];
+  const host = req.get("host");
+
+  if (!action) {
     return res.json({
       user_info: {
-        username,
-        password,
-        message: 'Welcome to IPTV Panel',
-        auth: 1,
-        status: 'Active',
-        exp_date: null,
-        is_trial: '0',
-        active_cons: '1',
-        created_at: String(user.createdAt),
-        max_connections: '10',
-        allowed_output_formats: ['ts'],
+        auth: 1, status: user.status,
+        exp_date: user.exp_date || "1924905600",
+        max_connections: "0", active_cons: "0", is_trial: "0", created_at: "1609459200",
       },
-      server_info: {
-        url: baseUrl,
-        port: req.socket.localPort || 443,
-        https_port: 443,
-        server_protocol: req.protocol,
-        rtmp_port: '1935',
-        timezone: 'UTC',
-        timestamp_now: now(),
-        time_now: new Date().toISOString().slice(0, 19).replace('T', ' '),
-      },
+      server_info: { url: host, port: String(PORT), server_protocol: "http", timezone: "GMT", timestamp: Math.floor(Date.now() / 1000) },
     });
   }
 
-  if (action === 'get_live_categories') {
-    return res.json([{ category_id: '1', category_name: 'Live TV', parent_id: 0 }]);
+  if (action === "get_live_categories") {
+    return res.json(categories.map((cat, i) => ({ category_id: String(i + 1), category_name: cat, parent_id: 0 })));
   }
 
-  if (action === 'get_live_streams') {
-    const all = await getAllStreams();
-    const list = Object.keys(all).map((name, i) => ({
-      num: i + 1,
-      name,
-      stream_type: 'live',
-      stream_id: name,
-      stream_icon: '',
-      epg_channel_id: name,
-      added: String(user.createdAt),
-      category_id: '1',
-      custom_sid: '',
-      tv_archive: 0,
-      // Filled so TiviMate/Smarters skip URL construction and use this directly
-      direct_source: `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(name)}`,
-      tv_archive_duration: 0,
-    }));
-    return res.json(list);
+  if (action === "get_live_streams") {
+    let filtered = streams;
+    if (category_id) {
+      const catName = categories[parseInt(category_id, 10) - 1];
+      filtered = streams.filter(s => (s.category || "Uncategorized") === catName);
+    }
+    return res.json(filtered.map(s => ({
+      num: s.id, name: s.name, stream_type: "live", stream_id: s.id,
+      stream_icon: s.logo || "", epg_channel_id: "", added: "1609459200",
+      category_id: String(categories.indexOf(s.category || "Uncategorized") + 1),
+      custom_sid: "", tv_archive: 0, direct_source: "", tv_archive_duration: 0, thumbnail: "",
+    })));
   }
 
-  if (action === 'get_vod_categories' || action === 'get_series' || action === 'get_series_categories' || action === 'get_vod_streams') {
-    return res.json([]);
-  }
-
-  return res.json([]);
+  res.json([]);
 });
 
-// ---------- get.php (M3U playlist) ----------
-app.get('/get.php', async (req, res) => {
+// -------------------------------------------------------------
+// M3U playlist
+// -------------------------------------------------------------
+app.get("/get.php", (req, res) => {
   const { username, password } = req.query;
-  const user = users[username];
-  if (!user || user.password !== password) {
-    return res.status(401).send('#EXTM3U\n# Authentication failed');
+  const user = db.prepare("SELECT * FROM users WHERE username = ? AND password = ?").get(username, password);
+  if (!user) return res.status(401).send("Auth Failed");
+
+  const streams = db.prepare("SELECT * FROM streams").all();
+  const host = req.get("host");
+  let out = "#EXTM3U\n";
+  for (const s of streams) {
+    out += `#EXTINF:-1 tvg-id="${s.id}" group-title="${s.category || "Live"}",${s.name}\n`;
+    out += `http://${host}/${username}/${password}/${s.id}.ts\n`;
+  }
+  res.setHeader("Content-Type", "audio/x-mpegurl");
+  res.setHeader("Content-Disposition", "attachment; filename=playlist.m3u");
+  res.send(out);
+});
+
+// -------------------------------------------------------------
+// Proxy tunnel  /:u/:p/:file
+// -------------------------------------------------------------
+app.get("/:u/:p/:file", async (req, res, next) => {
+  const { u, p, file } = req.params;
+  if (["api", "src", "node_modules", "assets", "dist"].includes(u) || file === "favicon.ico" || file.includes("php")) return next();
+
+  const user = db.prepare("SELECT * FROM users WHERE username = ? AND password = ?").get(u, p);
+  if (!user) { auditLog("SECURITY", `Blocked unauthorized ${file} (u=${u})`); return res.status(403).send("Auth Failed"); }
+  if (user.status !== "Active") return res.status(403).send("Account is " + user.status);
+  if (user.exp_date && parseInt(user.exp_date, 10) < Math.floor(Date.now() / 1000)) return res.status(403).send("Account Expired");
+
+  const streamId = file.split(".")[0];
+  const stream = db.prepare("SELECT * FROM streams WHERE id = ?").get(streamId);
+  if (!stream) return res.status(404).send("Stream not found");
+
+  if (!stream.node) {
+    try {
+      let headers = {};
+      try { headers = stream.headers ? JSON.parse(stream.headers) : {}; } catch {}
+
+      // YouTube branch (yt-dlp + ffmpeg)
+      if (/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(stream.url)) {
+        const ytDlp = process.env.YT_DLP_PATH || "yt-dlp";
+        const args = ["--no-playlist", "--no-part", "--no-cache-dir", "--no-warnings",
+                      "-f", "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"];
+        const cookiePath = process.env.YT_COOKIES_FILE || path.join(DATA_DIR, "cookies.txt");
+        if (fs.existsSync(cookiePath)) args.push("--cookies", cookiePath);
+        args.push("--impersonate", "chrome");
+        if (process.env.YOUTUBE_PO_TOKEN) args.push("--extractor-args", `youtube:po_token=${process.env.YOUTUBE_PO_TOKEN}`);
+        args.push("-o", "-", stream.url);
+
+        const yt = spawn(ytDlp, args);
+        const ff = spawn("ffmpeg", ["-i", "pipe:0", "-c", "copy", "-f", "mpegts", "pipe:1"]);
+
+        const kill = () => { try { yt.kill(); } catch {} try { ff.kill(); } catch {} };
+        req.on("close", kill); res.on("close", kill);
+
+        yt.stdout.pipe(ff.stdin);
+        ff.stdout.pipe(res);
+
+        yt.stdout.on("error", e => { if (e.code !== "EPIPE") console.error("yt stdout:", e.message); });
+        ff.stdin.on("error", e => { if (e.code !== "EPIPE") console.error("ff stdin:", e.message); });
+        yt.stderr.on("data", d => { const m = d.toString(); if (m.includes("ERROR")) console.error("yt-dlp:", m); });
+        yt.on("error", e => { console.error("spawn yt-dlp:", e.message); if (!res.headersSent) res.status(503).send("YouTube unreachable"); });
+
+        res.setHeader("Content-Type", "video/mp2t");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("Cache-Control", "no-cache, no-store");
+        return;
+      }
+
+      // Generic HTTP stream
+      const upstream = await axios({ method: "get", url: stream.url, responseType: "stream", timeout: 15000, headers, decompress: false });
+      res.setHeader("Content-Type", "video/mp2t");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("Cache-Control", "no-cache, no-store");
+      upstream.data.on("error", e => { if (e.code !== "EPIPE") upstream.data.destroy(); });
+      upstream.data.pipe(res);
+      req.on("close", () => upstream.data.destroy());
+    } catch (e) {
+      if (!res.headersSent) res.status(503).send("Source unreachable");
+    }
+    return;
   }
 
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
-  const all = await getAllStreams();
-
-  let m3u = '#EXTM3U\n';
-  for (const name of Object.keys(all)) {
-    const streamUrl = `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(name)}`;
-    m3u += `#EXTINF:-1 tvg-id="${name}" tvg-name="${name}" group-title="Live TV",${name}\n`;
-    m3u += `${streamUrl}\n`;
-  }
-
-  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-  res.send(m3u);
-});
-
-// ---------- Live stream proxy (Xtream path) ----------
-// /live/:username/:password/:streamId(.m3u8|.ts|...)
-app.get('/live/:username/:password/:streamId', async (req, res) => {
-  const { username, password } = req.params;
-
-  // Strip extension so "mbc1.m3u8" and "mbc1.ts" both resolve to "mbc1"
-  const streamId = req.params.streamId.replace(/\.(m3u8|ts|mp4|mkv|m4s|aac)$/i, '');
-
-  const user = users[username];
-  if (!user || user.password !== password) return res.status(401).send('Unauthorized');
-
-  // No stream-assignment check: every user can access every stream
-  const stream = await findStream(streamId);
-  if (!stream) return res.status(404).send('Stream not found');
-
-  await proxyHandler(req, res, stream.url, stream);
-});
-
-// ---------- Public clean stream (no auth, for direct testing) ----------
-app.get('/stream/:name', async (req, res) => {
-  const stream = await findStream(req.params.name);
-  if (!stream) return res.status(404).send('Stream not found');
-  await proxyHandler(req, res, stream.url, stream);
-});
-
-// ---------- Internal segment proxy ----------
-app.get('/proxy', async (req, res) => {
-  if (!req.query.url) return res.status(400).send('Missing url');
-  await proxyHandler(req, res, req.query.url, { userAgent: req.query.ua, referer: req.query.rf });
-});
-
-// =============================================================
-// Shared proxy handler
-// =============================================================
-async function proxyHandler(req, res, targetUrl, opts = {}) {
-  const headers = { 'User-Agent': opts.userAgent || 'Mozilla/5.0 (compatible; IPTVProxy/1.0)' };
-  if (opts.referer) headers['Referer'] = opts.referer;
-  if (req.headers.range) headers['Range'] = req.headers.range;
-
+  // Edge-node branch
+  const node = db.prepare("SELECT * FROM nodes WHERE url = ?").get(stream.node);
+  if (!node) return res.status(502).send("Node unconfigured");
   try {
-    const upstream = await fetch(targetUrl, { headers, redirect: 'follow', timeout: 20_000 });
-    if (!upstream.ok && upstream.status !== 206) return res.status(upstream.status).send('Upstream ' + upstream.status);
+    const edge = await axios({
+      method: "get", url: `${node.url}/${u}/${p}/${file}`,
+      responseType: "stream", timeout: 15000,
+      headers: { Authorization: `Bearer ${node.token || ""}` }, decompress: false,
+    });
+    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("Cache-Control", "no-cache, no-store");
+    edge.data.on("error", e => { if (e.code !== "EPIPE") edge.data.destroy(); });
+    edge.data.pipe(res);
+    req.on("close", () => edge.data.destroy());
+  } catch { res.status(503).send("Edge unreachable"); }
+});
 
-    const ct = upstream.headers.get('content-type') || '';
-    const finalUrl = upstream.url || targetUrl;
-    const isM3U8 = ct.includes('mpegurl') || finalUrl.split('?')[0].endsWith('.m3u8');
+// -------------------------------------------------------------
+// Embedded admin dashboard (replaces the Vite frontend)
+// -------------------------------------------------------------
+app.get("/", (req, res) => res.send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>ClusterCore</title>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-900 text-white p-6">
+<div class="max-w-4xl mx-auto">
+  <h1 class="text-2xl font-bold mb-4 text-blue-400">ClusterCore · Admin</h1>
+  <p class="text-gray-400 text-sm mb-6">Use the API endpoints below (all require <code>X-Admin-Auth</code> header):</p>
+  <ul class="space-y-2 text-sm font-mono text-gray-300">
+    <li>GET  /api/streams</li>
+    <li>POST /api/streams</li>
+    <li>POST /api/streams/fetch</li>
+    <li>GET  /api/users · POST /api/users</li>
+    <li>GET  /api/nodes · POST /api/nodes</li>
+    <li>GET  /api/profiles · POST /api/profiles</li>
+    <li>GET  /api/category-logos · POST /api/category-logos</li>
+    <li>GET  /api/logs</li>
+    <li>GET  /player_api.php?username=…&password=…</li>
+    <li>GET  /get.php?username=…&password=…</li>
+  </ul>
+</div></body></html>`));
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'no-cache');
-
-    if (isM3U8) {
-      const text = await upstream.text();
-      const qs = new URLSearchParams();
-      if (opts.userAgent) qs.set('ua', opts.userAgent);
-      if (opts.referer)   qs.set('rf', opts.referer);
-      const suffix = qs.toString() ? '&' + qs.toString() : '';
-      const proxyBase = `${req.protocol}://${req.get('host')}/proxy?url=`;
-      const rewritten = rewriteM3U8(text, new URL(finalUrl), proxyBase, suffix);
-      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-      return res.send(rewritten);
-    }
-
-    res.status(upstream.status);
-    res.setHeader('Content-Type', ct || 'application/octet-stream');
-    for (const h of ['accept-ranges', 'content-range', 'content-length']) {
-      const v = upstream.headers.get(h);
-      if (v) res.setHeader(h.split('-').map(s => s[0].toUpperCase() + s.slice(1)).join('-'), v);
-    }
-    upstream.body.pipe(res);
-  } catch (err) {
-    res.status(502).send('Proxy error: ' + err.message);
+// -------------------------------------------------------------
+// Boot
+// -------------------------------------------------------------
+app.listen(PORT, "0.0.0.0", () => {
+  auditLog("SYSTEM", "ClusterCore initialized");
+  console.log(`Listening on :${PORT}`);
+  if (!m3uFetchInterval) {
+    fetchExternalM3U();
+    m3uFetchInterval = setInterval(fetchExternalM3U, 30_000);
   }
-}
-
-function rewriteM3U8(text, baseUrl, proxyBase, suffix) {
-  return text.split('\n').map(raw => {
-    const line = raw.trim();
-    if (!line) return raw;
-    if (line.startsWith('#EXT-X-KEY') || line.startsWith('#EXT-X-MAP') || line.startsWith('#EXT-X-MEDIA')) {
-      return line.replace(/URI="([^"]+)"/g, (m, uri) => {
-        try { return `URI="${proxyBase}${encodeURIComponent(new URL(uri, baseUrl).href)}${suffix}"`; }
-        catch { return m; }
-      });
-    }
-    if (line.startsWith('#')) return raw;
-    try { return proxyBase + encodeURIComponent(new URL(line, baseUrl).href) + suffix; }
-    catch { return raw; }
-  }).join('\n');
-}
-
-// =============================================================
-app.get('/', (req, res) => res.send(dashboardHTML));
-app.listen(PORT, () => console.log('IPTV Panel (Xtream Codes) on ' + PORT));
+});
